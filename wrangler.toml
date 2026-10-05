@@ -1,0 +1,12 @@
+name = "woran"
+main = "worker.js"
+
+compatibility_date = "2026-10-05"
+
+workers_dev = true
+
+[vars]
+GITHUB_OWNER = "SpamOtpMoan-gif"
+GITHUB_REPO = "Woran"
+GITHUB_WORKFLOW = "build-flutter.yml"
+GITHUB_REF = "main"
