@@ -1,0 +1,305 @@
+name: Flutter Build Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "Unique build/job ID"
+        required: true
+        type: string
+
+      userId:
+        description: "Telegram User ID"
+        required: true
+        type: string
+
+      payload:
+        description: "JSON payload containing mode/url/buildType"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flutter-build-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p \
+            "$RUNNER_TEMP/source" \
+            "$RUNNER_TEMP/output"
+
+
+      - name: Download source ZIP
+        shell: bash
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          payload = json.loads(os.environ["PAYLOAD"])
+
+          url = payload.get("url")
+
+          if not url:
+              raise SystemExit("payload.url tidak ditemukan")
+
+          if not url.startswith("https://"):
+              raise SystemExit("URL source harus HTTPS")
+
+          output = os.path.join(
+              os.environ["RUNNER_TEMP"],
+              "source.zip"
+          )
+
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "User-Agent":
+                  "github-actions-flutter-worker"
+              }
+          )
+
+          with urllib.request.urlopen(
+              request,
+              timeout=120
+          ) as response:
+
+              with open(output, "wb") as f:
+                  while True:
+                      chunk = response.read(1024 * 1024)
+
+                      if not chunk:
+                          break
+
+                      f.write(chunk)
+
+          print(
+              f"Downloaded {os.path.getsize(output)} bytes"
+          )
+          PY
+
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import zipfile
+
+          source_zip = os.path.join(
+              os.environ["RUNNER_TEMP"],
+              "source.zip"
+          )
+
+          destination = os.path.join(
+              os.environ["RUNNER_TEMP"],
+              "source"
+          )
+
+          with zipfile.ZipFile(source_zip) as z:
+              z.extractall(destination)
+
+          print(
+              "Source extracted to:",
+              destination
+          )
+          PY
+
+
+      - name: Locate Flutter project
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$RUNNER_TEMP/source"
+          PROJECT=""
+
+          if [ -f "$ROOT/pubspec.yaml" ]; then
+            PROJECT="$ROOT"
+          else
+            PROJECT="$(
+              find "$ROOT" \
+                -maxdepth 5 \
+                -type f \
+                -name pubspec.yaml \
+                -print -quit |
+              xargs -r dirname
+            )"
+          fi
+
+          if [ -z "$PROJECT" ] ||
+             [ ! -f "$PROJECT/pubspec.yaml" ]; then
+
+            echo "ERROR: pubspec.yaml tidak ditemukan."
+
+            find "$ROOT" \
+              -maxdepth 4 \
+              -type f |
+              head -200
+
+            exit 1
+          fi
+
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+
+          echo "Flutter project:"
+          echo "$PROJECT"
+
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+
+      - name: Flutter doctor
+        working-directory: ${{ steps.locate.outputs.project }}
+        run: flutter doctor -v
+
+
+      - name: Flutter pub get
+        working-directory: ${{ steps.locate.outputs.project }}
+        run: flutter pub get
+
+
+      - name: Read build mode
+        id: mode
+        shell: bash
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+
+          MODE="$(
+            python3 - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(
+              os.environ["PAYLOAD"]
+          )
+
+          print(
+              (payload.get("buildType") or "release")
+              .lower()
+          )
+          PY
+          )"
+
+          case "$MODE" in
+            debug)
+              echo "mode=debug" >> "$GITHUB_OUTPUT"
+              ;;
+
+            profile)
+              echo "mode=profile" >> "$GITHUB_OUTPUT"
+              ;;
+
+            release)
+              echo "mode=release" >> "$GITHUB_OUTPUT"
+              ;;
+
+            *)
+              echo "mode=release" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+
+      - name: Build APK
+        working-directory: ${{ steps.locate.outputs.project }}
+        env:
+          BUILD_MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          set -euo pipefail
+
+          case "$BUILD_MODE" in
+
+            debug)
+              flutter build apk --debug
+              ;;
+
+            profile)
+              flutter build apk --profile
+              ;;
+
+            release)
+              flutter build apk --release
+              ;;
+
+          esac
+
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.locate.outputs.project }}"
+          OUT="$RUNNER_TEMP/output"
+
+          APK="$(
+            find \
+              "$PROJECT/build/app/outputs/apk" \
+              -type f \
+              -name '*.apk' \
+              -print -quit ||
+            true
+          )"
+
+          if [ -z "$APK" ]; then
+
+            echo "ERROR: APK tidak ditemukan."
+
+            find "$PROJECT/build" \
+              -type f |
+              head -200 ||
+              true
+
+            exit 1
+          fi
+
+          cp \
+            "$APK" \
+            "$OUT/app-${{ inputs.jobId }}.apk"
+
+          echo "APK:"
+          ls -lh "$OUT"
+
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: ${{ runner.temp }}/output/*.apk
+          if-no-files-found: error
+          retention-days: 1
